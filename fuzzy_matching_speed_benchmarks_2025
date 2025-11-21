@@ -1,0 +1,493 @@
+"""
+1M-Row Fuzzy Matching Benchmark (2025): Similarity API vs RapidFuzz, TheFuzz, Levenshtein
+
+Benchmarks:
+
+- Similarity API  (cloud, threshold-based dedupe)
+- RapidFuzz
+- TheFuzz (FuzzyWuzzy fork)
+- python-Levenshtein
+
+Key features:
+
+- Dataset sizes: 10k, 100k, 1M strings
+- RapidFuzz measured at 10k and 100k, estimated at 1M
+- TheFuzz & python-Levenshtein measured at 10k, estimated at 100k and 1M
+- Fair RapidFuzz usage (vectorised C++ engine)
+- Precision accuracy sanity check on a small sample
+- Simple environment printout (CPU, RAM, Python)
+"""
+
+import os
+import platform
+import random
+import string
+import time
+from dataclasses import dataclass
+from typing import Callable, Dict, Iterable, List, Sequence, Tuple
+
+import numpy as np
+import psutil
+import requests
+from rapidfuzz import fuzz as rf_fuzz
+from rapidfuzz import process as rf_process
+from thefuzz import fuzz as tf_fuzz
+import Levenshtein as lev
+
+
+# ============================
+# CONFIG
+# ============================
+
+DATASET_SIZES = [10_000, 100_000, 1_000_000]
+
+# Per-tool max N for *measured* all-to-all runs.
+# Beyond these sizes we estimate via quadratic scaling.
+RAPIDFUZZ_MAX_N = 100_000       # run RapidFuzz at 10k and 100k
+OTHER_LIB_MAX_N = 10_000        # run TheFuzz / Levenshtein only at 10k
+
+# Similarity threshold in the 0–100 range for local libs
+LOCAL_SIMILARITY_THRESHOLD = 90
+
+# Similarity threshold for Similarity API (0–1)
+API_SIMILARITY_THRESHOLD = 0.85
+
+# Endpoint & auth
+SIMILARITY_API_URL = "https://api.similarity-api.com/dedupe"
+
+# >>> Replace this with your real key. <<<
+SIMILARITY_API_KEY_ENV = os.getenv("SIMILARITY_API_KEY")
+
+
+# A tiny dataset size for quick accuracy sanity checks
+ACCURACY_SAMPLE_SIZE = 2_000
+
+
+# ============================
+# ENVIRONMENT DESCRIPTION
+# ============================
+
+def describe_environment() -> None:
+    """Print basic machine / Python info for reproducibility."""
+    print("=== Environment ===")
+    print(f"Python      : {platform.python_version()}")
+    print(f"Platform    : {platform.platform()}")
+    print(f"Processor   : {platform.processor() or 'N/A'}")
+    print(f"CPU cores   : {os.cpu_count()}")
+    try:
+        mem = psutil.virtual_memory().total / (1024 ** 3)
+        print(f"RAM         : {mem:.1f} GB")
+    except Exception:
+        print("RAM         : psutil not available")
+    print("===================\n")
+
+
+# ============================
+# SYNTHETIC DATA GENERATION
+# ============================
+
+BASE_NAMES = [
+    "Alice J.",
+    "Bob Smith",
+    "Charlie Brown",
+    "Diana Prince",
+    "Eve Adams",
+    "Franklin D. Roosevelt",
+    "Microsoft Corp",
+    "Apple Inc.",
+    "Alphabet Holdings",
+    "Intercom",
+    "Notion",
+    "Globex Corp",
+    "Initech LLC",
+    "Stark Industries",
+    "Wayne Enterprises",
+]
+
+
+def random_insert_char(s: str) -> str:
+    pos = random.randint(0, len(s))
+    c = random.choice(string.ascii_letters)
+    return s[:pos] + c + s[pos:]
+
+
+def random_delete_char(s: str) -> str:
+    if len(s) <= 1:
+        return s
+    pos = random.randint(0, len(s) - 1)
+    return s[:pos] + s[pos + 1:]
+
+
+def random_swap_adjacent(s: str) -> str:
+    if len(s) < 2:
+        return s
+    pos = random.randint(0, len(s) - 2)
+    chars = list(s)
+    chars[pos], chars[pos + 1] = chars[pos + 1], chars[pos]
+    return "".join(chars)
+
+
+def random_replace_char(s: str) -> str:
+    if not s:
+        return s
+    pos = random.randint(0, len(s) - 1)
+    c = random.choice(string.ascii_letters + " ")
+    return s[:pos] + c + s[pos + 1:]
+
+
+TYPO_FUNCS = [
+    random_insert_char,
+    random_delete_char,
+    random_swap_adjacent,
+    random_replace_char,
+]
+
+
+def add_typo(s: str) -> str:
+    """Apply 1–2 random character-level edits to simulate messy data."""
+    if len(s) < 4:
+        return s
+    num_edits = random.choice([1, 1, 2])  # mostly 1 edit, sometimes 2
+    for _ in range(num_edits):
+        s = random.choice(TYPO_FUNCS)(s)
+    return s
+
+
+def generate_strings(n: int) -> List[str]:
+    """Generate N noisy strings (no labels)."""
+    return [add_typo(random.choice(BASE_NAMES)) for _ in range(n)]
+
+
+
+# ============================
+# GROUND TRUTH & METRICS
+# ============================
+
+Pair = Tuple[int, int]
+
+
+def compute_true_pairs(labels: Sequence[int]) -> set[Pair]:
+    """All index pairs (i, j) with identical cluster labels."""
+    true_pairs: set[Pair] = set()
+    n = len(labels)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if labels[i] == labels[j]:
+                true_pairs.add((i, j))
+    return true_pairs
+
+
+def evaluate_pairs(pred_pairs: Iterable[Pair], true_pairs: set[Pair]) -> Tuple[float, float]:
+    """Return precision for predicted vs. true duplicate pairs."""
+    pred_set = set(pred_pairs)
+    tp = len(pred_set & true_pairs)
+    fp = len(pred_set - true_pairs)
+
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    return precision
+
+
+# ============================
+# LOCAL LIBRARY MATCHING
+# ============================
+
+def threshold_matches_naive(
+    strings: Sequence[str],
+    scorer: Callable[[str, str], float],
+    threshold: float,
+) -> List[Pair]:
+    """
+    Naive all-to-all threshold matching using a provided scorer.
+
+    Used for:
+      - TheFuzz (fuzz.ratio)
+      - python-Levenshtein (normalized similarity)
+    """
+    matches: List[Pair] = []
+    n = len(strings)
+    for i in range(n):
+        s1 = strings[i]
+        for j in range(i + 1, n):
+            s2 = strings[j]
+            score = scorer(s1, s2)
+            if score >= threshold:
+                matches.append((i, j))
+    return matches
+
+
+def threshold_matches_rapidfuzz(
+    strings: Sequence[str],
+    threshold: float,
+    block_size: int = 5000,
+) -> List[Pair]:
+    """
+    Memory-safe all-to-all matching for RapidFuzz.
+
+    Computes similarities in blocks so we never allocate an NxN matrix.
+    Complexity is still O(N^2), but memory is O(block_size * N).
+
+    block_size=5000 is a good Colab-safe default.
+    """
+    n = len(strings)
+    matches: List[Pair] = []
+
+    for i0 in range(0, n, block_size):
+        i1 = min(i0 + block_size, n)
+        block = strings[i0:i1]
+
+        # block vs full (block_size x n)
+        sim_block = rf_process.cdist(
+            block,
+            strings,
+            scorer=rf_fuzz.ratio,
+            dtype=np.uint8,
+            workers=-1,
+        )
+
+        for bi, row in enumerate(sim_block):
+            i = i0 + bi
+            # only upper triangle (j > i)
+            for j in range(i + 1, n):
+                if row[j] >= threshold:
+                    matches.append((i, j))
+
+    return matches
+
+
+# ============================
+# SIMILARITY API
+# ============================
+
+def call_similarity_api_dedupe(strings: Sequence[str]) -> Dict:
+    """
+    Make a single /dedupe call to Similarity API and return response JSON.
+
+    We use 'index_pairs' so we can evaluate precision on duplicate pairs.
+    """
+    api_key = SIMILARITY_API_KEY_ENV 
+    if not api_key:
+        raise RuntimeError(
+            "SIMILARITY_API_KEY is not set. Replace YOUR_SIMILARITY_API_KEY_HERE "
+            "with your real API key before running."
+        )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "data": list(strings),
+        "config": {
+            "similarity_threshold": API_SIMILARITY_THRESHOLD,
+            "remove_punctuation": False,
+            "to_lowercase": False,
+            "use_token_sort": False,
+            "output_format": "index_pairs",
+        },
+    }
+
+    response = requests.post(
+        SIMILARITY_API_URL,
+        headers=headers,
+        json=payload,
+        timeout=1200,  # up to 20 minutes for the largest case (it takes around 7 with the default seed and generated data)
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def extract_pairs_from_api_response(resp: Dict) -> List[Pair]:
+    """
+    Translate Similarity API 'index_pairs' response into a list of (i, j) pairs.
+    """
+    pairs: List[Pair] = []
+    for row in resp.get("response_data", []):
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        i, j = int(row[0]), int(row[1])
+        if i < j:
+            pairs.append((i, j))
+        elif j < i:
+            pairs.append((j, i))
+    return pairs
+
+
+# ============================
+# BENCHMARK DRIVER
+# ============================
+
+@dataclass
+class TimingResult:
+    tool_name: str
+    n: int
+    seconds: float
+    mode: str  
+
+
+def time_function(fn: Callable[[], object]) -> float:
+    start = time.time()
+    _ = fn()
+    end = time.time()
+    return round(end - start, 3)
+
+
+def scale_quadratic(t_small: float, n_small: int, n_large: int) -> float:
+    """
+    Estimate runtime for O(N^2) algorithms using a known timing at n_small.
+
+    Time ~ k * N^2  =>  t_large ≈ t_small * (n_large / n_small)^2
+    """
+    factor = (n_large / n_small) ** 2
+    return round(t_small * factor, 1)
+
+
+def benchmark_accuracy() -> None:
+    """
+    Quick, small-scale accuracy sanity check.
+
+    For each tool, when it says "these two strings are duplicates",
+    are those pairs actually duplicates according to our synthetic labels?
+
+    """
+    print(f"=== Accuracy sanity check (n={ACCURACY_SAMPLE_SIZE}) ===")
+    strings, labels = generate_strings_with_labels(ACCURACY_SAMPLE_SIZE)
+    true_pairs = compute_true_pairs(labels)
+
+    # RapidFuzz
+    rf_pairs = threshold_matches_rapidfuzz(strings, LOCAL_SIMILARITY_THRESHOLD)
+    rf_p, _ = evaluate_pairs(rf_pairs, true_pairs)
+    print(f"RapidFuzz          – precision={rf_p:.3f}")
+
+    # TheFuzz
+    tf_pairs = threshold_matches_naive(strings, tf_fuzz.ratio, LOCAL_SIMILARITY_THRESHOLD)
+    tf_p, _ = evaluate_pairs(tf_pairs, true_pairs)
+    print(f"TheFuzz            – precision={tf_p:.3f}")
+
+    # Levenshtein (normalized similarity 0–100)
+    def lev_score_0_100(a: str, b: str) -> float:
+        d = lev.distance(a, b)
+        max_len = max(len(a), len(b)) or 1
+        sim = 1.0 - d / max_len
+        return sim * 100.0
+
+    lev_pairs = threshold_matches_naive(strings, lev_score_0_100, LOCAL_SIMILARITY_THRESHOLD)
+    lev_p, _ = evaluate_pairs(lev_pairs, true_pairs)
+    print(f"python-Levenshtein – precision={lev_p:.3f}")
+
+    # Similarity API – pair output, same precision metric
+    api_resp = call_similarity_api_dedupe(strings)
+    api_pairs = extract_pairs_from_api_response(api_resp)
+    api_p, _ = evaluate_pairs(api_pairs, true_pairs)
+    print(f"Similarity API     – precision={api_p:.3f}")
+
+    print("====================================================\n")
+
+
+def run_benchmarks() -> List[TimingResult]:
+    """
+    Run performance benchmarks for all tools and dataset sizes.
+
+    Similarity API:
+      - measured at all DATASET_SIZES
+
+    RapidFuzz:
+      - measured up to RAPIDFUZZ_MAX_N (10k and 100k)
+      - estimated at larger sizes via O(N²) scaling from the largest measured N
+
+    TheFuzz & python-Levenshtein:
+      - measured up to OTHER_LIB_MAX_N (10k)
+      - estimated at larger sizes via O(N²) scaling from the largest measured N
+    """
+    results: List[TimingResult] = []
+
+    # Per-tool base timing and base N for scaling.
+    base_times: Dict[str, float] = {}
+    base_ns: Dict[str, int] = {}
+
+    for n in DATASET_SIZES:
+        print(f"\n=== Benchmarking with n={n:,} strings ===")
+        strings = generate_strings(n)
+
+        # 1) Similarity API 
+        def run_api():
+            resp = call_similarity_api_dedupe(strings)
+            _ = resp
+
+        api_time = time_function(run_api)
+        print(f"Similarity API     : {api_time:.3f} s")
+        results.append(TimingResult("Similarity API", n, api_time, "measured"))
+
+        # 2) Local libraries
+        local_tools = ["RapidFuzz", "TheFuzz", "python-Levenshtein"]
+
+        for tool in local_tools:
+            # Decide the max measured N for this tool
+            if tool == "RapidFuzz":
+                max_n = RAPIDFUZZ_MAX_N
+            else:
+                max_n = OTHER_LIB_MAX_N
+
+            if n <= max_n:
+                # Measured run
+                if tool == "RapidFuzz":
+                    def run_rf():
+                        _ = threshold_matches_rapidfuzz(strings, LOCAL_SIMILARITY_THRESHOLD)
+                    t = time_function(run_rf)
+
+                elif tool == "TheFuzz":
+                    def run_tf():
+                        _ = threshold_matches_naive(strings, tf_fuzz.ratio, LOCAL_SIMILARITY_THRESHOLD)
+                    t = time_function(run_tf)
+
+                else:  # python-Levenshtein
+                    def lev_score(a: str, b: str) -> float:
+                        d = lev.distance(a, b)
+                        max_len = max(len(a), len(b)) or 1
+                        sim = 1.0 - d / max_len
+                        return sim * 100.0
+
+                    def run_lev():
+                        _ = threshold_matches_naive(strings, lev_score, LOCAL_SIMILARITY_THRESHOLD)
+                    t = time_function(run_lev)
+
+                print(f"{tool:17}: {t:.3f} s (measured)")
+                results.append(TimingResult(tool, n, t, "measured"))
+
+                # Update base timing for this tool if this is the largest N so far
+                if tool not in base_ns or n > base_ns[tool]:
+                    base_ns[tool] = n
+                    base_times[tool] = t
+
+            else:
+                # Estimated run using O(N²) from the largest measured N
+                if tool not in base_ns:
+                    raise RuntimeError(
+                        f"No base timing available for {tool}. "
+                        f"Ensure DATASET_SIZES includes {max_n:,} or a smaller size first."
+                    )
+                est = scale_quadratic(base_times[tool], base_ns[tool], n)
+                print(
+                    f"{tool:17}: ~{est:.1f} s "
+                    f"(estimated, O(N^2) from n={base_ns[tool]:,})"
+                )
+                results.append(TimingResult(tool, n, est, "estimated"))
+
+    # Final summary
+    print("\n=== Summary (seconds) ===")
+    for r in results:
+        marker = "" if r.mode == "measured" else " (est.)"
+        print(f"{r.tool_name:17} n={r.n:>7,d}: {r.seconds:>8.1f}{marker}")
+    print("=========================\n")
+
+    return results
+
+
+# ============================
+# MAIN
+# ============================
+
+if __name__ == "__main__":
+    random.seed(42)
+    describe_environment()
+    benchmark_accuracy()
+    run_benchmarks()
