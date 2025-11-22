@@ -182,7 +182,7 @@ def compute_true_pairs(labels: Sequence[int]) -> set[Pair]:
     return true_pairs
 
 
-def evaluate_pairs(pred_pairs: Iterable[Pair], true_pairs: set[Pair]) -> Tuple[float, float]:
+def evaluate_pairs(pred_pairs: Iterable[Pair], true_pairs: set[Pair]) -> float:
     """Return precision for predicted vs. true duplicate pairs."""
     pred_set = set(pred_pairs)
     tp = len(pred_set & true_pairs)
