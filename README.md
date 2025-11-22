@@ -2,7 +2,7 @@
 
 This repository is the public home for all technical evaluations, experiments, and real-world demonstrations of **Similarity API**.
 
-We use this space to openly publish reproducible benchmarks, accuracy studies, performance comparisons, and practical examples that showcase where Similarity API provides exceptional advantages over traditional approaches — including fuzzy matching libraries, embeddings-based similarity, custom dedupe pipelines, and rule-based systems.
+We use this space to openly publish reproducible benchmarks, accuracy studies, performance comparisons, and practical examples that showcase where Similarity API is faster or simpler than local approaches — including fuzzy matching libraries, embeddings-based similarity, custom dedupe pipelines, and rule-based systems.
 
 Our philosophy is simple:
 
