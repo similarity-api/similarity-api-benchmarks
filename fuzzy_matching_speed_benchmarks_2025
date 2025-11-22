@@ -355,7 +355,7 @@ def benchmark_accuracy() -> None:
 
     """
     print(f"=== Accuracy sanity check (n={ACCURACY_SAMPLE_SIZE}) ===")
-    strings, labels = generate_strings_with_labels(ACCURACY_SAMPLE_SIZE)
+    strings, labels = generate_strings(ACCURACY_SAMPLE_SIZE)
     true_pairs = compute_true_pairs(labels)
 
     # RapidFuzz
