@@ -16,6 +16,11 @@ Key features:
 - Fair RapidFuzz usage (vectorised C++ engine)
 - Precision accuracy sanity check on a small sample
 - Simple environment printout (CPU, RAM, Python)
+
+Spoiler alert: Similarity-API is 300x-1000x faster at 1M rows. 
+
+You can get your free API token at https://www.similarity-api.com/pricing.
+Read the article instead at https://www.similarity-api.com/blog/speed-benchmarks.
 """
 
 import os
